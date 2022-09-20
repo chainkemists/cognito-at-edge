@@ -159,6 +159,11 @@ describe('createAuthenticator', () => {
     expect(typeof new Authenticator(params)).toBe('object');
   });
 
+  test('should create authenticator with a custom error handler', () => {
+    params.errorHandler = () => {};
+    expect(typeof new Authenticator(params)).toBe('object');
+  });
+
   test('should fail when creating authenticator without params', () => {
     // @ts-ignore 
     // ts-ignore is used here to override typescript's type check in the constructor
@@ -214,6 +219,11 @@ describe('createAuthenticator', () => {
   test('should fail when creating authenticator with invalid disableCookieDomain', () => {
     params.disableCookieDomain = '123';
     expect(() => new Authenticator(params)).toThrow('disableCookieDomain');
+  });
+
+  test('should fail when creating authenticator with invalid error handler', () => {
+    params.errorHandler = 'not a function';
+    expect(() => new Authenticator(params)).toThrow('errorHandler');
   });
 });
 
@@ -280,6 +290,48 @@ describe('handle', () => {
         },
       },
     )
+      .then(() => {
+        expect(authenticator._jwtVerifier.verify).toHaveBeenCalled();
+      });
+  });
+});
+
+describe('custom error handler', () => {
+  let authenticator;
+
+  beforeEach(() => {
+    authenticator = new Authenticator({
+      region: 'us-east-1',
+      userPoolId: 'us-east-1_abcdef123',
+      userPoolAppId: '123456789qwertyuiop987abcd',
+      userPoolDomain: 'my-cognito-domain.auth.us-east-1.amazoncognito.com',
+      cookieExpirationDays: 365,
+      logLevel: 'debug',
+      errorHandler: async () => {
+        return {
+          status: '401',
+          statusDescription: 'Unauthorized',
+          body: 'Unauthorized',
+        };
+      },
+    });
+    authenticator._jwtVerifier.cacheJwks(jwksData);
+    jest.spyOn(authenticator, '_getIdTokenFromCookie');
+    jest.spyOn(authenticator, '_fetchTokensFromCode');
+    jest.spyOn(authenticator, '_getRedirectResponse');
+    jest.spyOn(authenticator._jwtVerifier, 'verify');
+  });
+
+  test('should call our error handler if unauthenticated', () => {
+    authenticator._jwtVerifier.verify.mockImplementationOnce(async () => {
+      throw new Error();
+    });
+    return expect(authenticator.handle(getCloudfrontRequest()))
+      .resolves.toEqual({
+        status: '401',
+        statusDescription: 'Unauthorized',
+        body: 'Unauthorized',
+      })
       .then(() => {
         expect(authenticator._jwtVerifier.verify).toHaveBeenCalled();
       });

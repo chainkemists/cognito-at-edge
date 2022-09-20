@@ -13,6 +13,7 @@ interface AuthenticatorParams {
   cookieExpirationDays?: number;
   disableCookieDomain?: boolean;
   logLevel?: 'fatal' | 'error' | 'warn' | 'info' | 'debug' | 'trace' | 'silent';
+  errorHandler?: (event: CloudFrontRequestEvent) => Promise<CloudFrontRequestResult>;
 }
 
 export class Authenticator {
@@ -26,6 +27,7 @@ export class Authenticator {
   _cookieBase: string;
   _logger;
   _jwtVerifier;
+  _errorHandler: (event: CloudFrontRequestEvent) => Promise<CloudFrontRequestResult>;
 
   constructor(params: AuthenticatorParams) {
     this._verifyParams(params);
@@ -46,6 +48,7 @@ export class Authenticator {
       clientId: params.userPoolAppId,
       tokenUse: 'id',
     });
+    this._errorHandler = params.errorHandler || this._defaultErrorHandler;
   }
 
   /**
@@ -67,6 +70,9 @@ export class Authenticator {
     }
     if ('disableCookieDomain' in params && typeof params.disableCookieDomain !== 'boolean') {
       throw new Error('Expected params.disableCookieDomain to be a boolean');
+    }
+    if ('errorHandler' in params && typeof params.errorHandler !== 'function') {
+      throw new Error('Expected params.errorHandler to be a function');
     }
   }
 
@@ -184,12 +190,55 @@ export class Authenticator {
     this._logger.debug("  idToken wasn't present in request cookies");
     throw new Error("Id token isn't present in the request cookies");
   }
+  /**
+   * Default Error Handler:
+   *   * if user is not authenticated (token not found or verify fails)
+   *   * redirects to the Cognito UserPool to authenticate the user
+   * @param  {Object}  event Lambda@Edge event.
+   * @return {Promise} CloudFront response.
+   */
+  async _defaultErrorHandler(
+    event: CloudFrontRequestEvent
+  ): Promise<CloudFrontRequestResult> {
+    const { request } = event.Records[0].cf;
+    const requestParams = parse(request.querystring);
+    const cfDomain = request.headers.host[0].value;
+    const redirectURI = `https://${cfDomain}`;
+    if (requestParams.code) {
+      return this._fetchTokensFromCode(redirectURI, requestParams.code)
+        .then(tokens => this._getRedirectResponse(tokens, cfDomain, requestParams.state));
+    } else {
+      let redirectPath = request.uri;
+      if (request.querystring && request.querystring !== '') {
+        redirectPath += encodeURIComponent('?' + request.querystring);
+      }
+      const userPoolUrl = `https://${this._userPoolDomain}/authorize?redirect_uri=${redirectURI}&response_type=code&client_id=${this._userPoolAppId}&state=${redirectPath}`;
+      this._logger.debug(`Redirecting user to Cognito User Pool URL ${userPoolUrl}`);
+      return {
+        status: '302',
+        headers: {
+          'location': [{
+            key: 'Location',
+            value: userPoolUrl,
+          }],
+          'cache-control': [{
+            key: 'Cache-Control',
+            value: 'no-cache, no-store, max-age=0, must-revalidate',
+          }],
+          'pragma': [{
+            key: 'Pragma',
+            value: 'no-cache',
+          }],
+        },
+      };
+    }
+  }
 
   /**
    * Handle Lambda@Edge event:
    *   * if authentication cookie is present and valid: forward the request
    *   * if ?code=<grant code> is present: set cookies with new tokens
-   *   * else redirect to the Cognito UserPool to authenticate the user
+   *   * else call the error handler function
    * @param  {Object}  event Lambda@Edge event.
    * @return {Promise} CloudFront response.
    */
@@ -197,9 +246,6 @@ export class Authenticator {
     this._logger.debug({ msg: 'Handling Lambda@Edge event', event });
 
     const { request } = event.Records[0].cf;
-    const requestParams = parse(request.querystring);
-    const cfDomain = request.headers.host[0].value;
-    const redirectURI = `https://${cfDomain}`;
 
     try {
       const token = this._getIdTokenFromCookie(request.headers.cookie);
@@ -209,34 +255,7 @@ export class Authenticator {
       return request;
     } catch (err) {
       this._logger.debug("User isn't authenticated: %s", err);
-      if (requestParams.code) {
-        return this._fetchTokensFromCode(redirectURI, requestParams.code)
-          .then(tokens => this._getRedirectResponse(tokens, cfDomain, requestParams.state));
-      } else {
-        let redirectPath = request.uri;
-        if (request.querystring && request.querystring !== '') {
-          redirectPath += encodeURIComponent('?' + request.querystring);
-        }
-        const userPoolUrl = `https://${this._userPoolDomain}/authorize?redirect_uri=${redirectURI}&response_type=code&client_id=${this._userPoolAppId}&state=${redirectPath}`;
-        this._logger.debug(`Redirecting user to Cognito User Pool URL ${userPoolUrl}`);
-        return {
-          status: '302',
-          headers: {
-            'location': [{
-              key: 'Location',
-              value: userPoolUrl,
-            }],
-            'cache-control': [{
-              key: 'Cache-Control',
-              value: 'no-cache, no-store, max-age=0, must-revalidate',
-            }],
-            'pragma': [{
-              key: 'Pragma',
-              value: 'no-cache',
-            }],
-          },
-        };
-      }
+      return this._errorHandler(event);
     }
   }
 }
